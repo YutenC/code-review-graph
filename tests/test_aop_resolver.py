@@ -1,6 +1,11 @@
+import re
 from pathlib import Path
 
-from code_review_graph.aop_resolver import resolve_aop_advice
+from code_review_graph.aop_resolver import (
+    _aspectj_pattern_to_regex,
+    _parse_execution_expression,
+    resolve_aop_advice,
+)
 from code_review_graph.graph import GraphStore
 from code_review_graph.parser import CodeParser, EdgeInfo
 from code_review_graph.tools.query import query_graph
@@ -229,3 +234,62 @@ def test_advises_and_advised_by_filter_out_plain_calls_edges(tmp_path: Path) -> 
 
     # The plain caller has no AOP relationships at all in either direction.
     assert query_graph("advises", plain_caller_qual, repo_root=str(tmp_path))["result_count"] == 0
+
+
+class TestAspectjPatternToRegex:
+    """Direct unit tests for the three documented conversion rules."""
+
+    def test_literal_pattern_matches_only_itself(self) -> None:
+        pattern = re.compile("^" + _aspectj_pattern_to_regex("PaymentService") + "$")
+        assert pattern.match("PaymentService")
+        assert not pattern.match("PaymentServiceImpl")
+        assert not pattern.match("paymentservice")
+
+    def test_single_star_does_not_cross_a_dot_boundary(self) -> None:
+        pattern = re.compile("^" + _aspectj_pattern_to_regex("*Service") + "$")
+        assert pattern.match("PaymentService")
+        assert pattern.match("Service")
+        assert not pattern.match("internal.Service")
+
+    def test_double_dot_becomes_a_permissive_any_match(self) -> None:
+        # ".." is documented as "any number of intervening path segments", but
+        # it compiles to a bare ".*" — it matches any characters at all, not
+        # only well-formed dot-separated segments. This test pins the actual
+        # (looser) behavior so a future change to the translation is a
+        # deliberate, visible diff rather than a silent regression either way.
+        pattern = re.compile("^" + _aspectj_pattern_to_regex("com..Service") + "$")
+        assert pattern.match("com.foo.bar.Service")
+        assert pattern.match("comXService")  # crosses non-dot characters too
+
+    def test_special_regex_characters_are_escaped(self) -> None:
+        pattern = re.compile("^" + _aspectj_pattern_to_regex("Foo$Bar") + "$")
+        assert pattern.match("Foo$Bar")
+        assert not pattern.match("FooXBar")
+
+
+class TestParseExecutionExpression:
+    def test_package_and_class_wildcard_needs_class_true(self) -> None:
+        result = _parse_execution_expression(
+            "execution(* com.foo.service.PaymentService.*(..))"
+        )
+        assert result is not None
+        regex_str, needs_class = result
+        assert needs_class is True
+        pattern = re.compile(regex_str)
+        assert pattern.match("PaymentService.pay")
+        assert not pattern.match("OtherService.pay")
+
+    def test_method_name_only_pattern_needs_class_false(self) -> None:
+        result = _parse_execution_expression("execution(* *get*Index(..))")
+        assert result is not None
+        regex_str, needs_class = result
+        assert needs_class is False
+        pattern = re.compile(regex_str)
+        assert pattern.match("getUserIndex")
+        assert not pattern.match("createUser")
+
+    def test_non_execution_expression_returns_none(self) -> None:
+        assert _parse_execution_expression("@annotation(com.foo.Bar)") is None
+
+    def test_missing_parameter_parens_returns_none(self) -> None:
+        assert _parse_execution_expression("execution(* com.foo.Bar.baz)") is None
