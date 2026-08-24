@@ -2,7 +2,7 @@ from pathlib import Path
 
 from code_review_graph.aop_resolver import resolve_aop_advice
 from code_review_graph.graph import GraphStore
-from code_review_graph.parser import CodeParser
+from code_review_graph.parser import CodeParser, EdgeInfo
 from code_review_graph.tools.query import query_graph
 
 ANNOTATION_SOURCE = """
@@ -187,3 +187,45 @@ def test_callers_of_query_finds_advice_method(tmp_path: Path) -> None:
     assert result["result_count"] == 1
     assert result["results"][0]["name"] == "beforeLimit"
     assert {edge["kind"] for edge in result["edges"]} == {"CALLS"}
+
+
+def test_advises_and_advised_by_filter_out_plain_calls_edges(tmp_path: Path) -> None:
+    """``advises``/``advised_by`` must return only aop_resolved edges, while
+    ``callers_of`` keeps returning every CALLS edge regardless of provenance.
+    """
+    path, store = _build_store(tmp_path, ANNOTATION_SOURCE)
+    try:
+        resolve_aop_advice(store)
+
+        target_qual = f"{path.as_posix()}::OrderController.placeOrder"
+        advice_qual = f"{path.as_posix()}::AccessLimitAspect.beforeLimit"
+        # A regular, non-AOP caller of the same target method.
+        plain_caller_qual = f"{path.as_posix()}::OrderController.unrelatedMethod"
+        store.upsert_edge(EdgeInfo(
+            kind="CALLS",
+            source=plain_caller_qual,
+            target=target_qual,
+            file_path=str(path),
+            line=1,
+        ))
+        store.commit()
+    finally:
+        store.close()
+
+    callers = query_graph("callers_of", target_qual, repo_root=str(tmp_path))
+    assert callers["result_count"] == 2
+    assert {r["name"] for r in callers["results"]} == {"beforeLimit", "unrelatedMethod"}
+
+    advised_by = query_graph("advised_by", target_qual, repo_root=str(tmp_path))
+    assert advised_by["status"] == "ok"
+    assert advised_by["result_count"] == 1
+    assert advised_by["results"][0]["name"] == "beforeLimit"
+    assert advised_by["edges"][0]["kind"] == "CALLS"
+
+    advises = query_graph("advises", advice_qual, repo_root=str(tmp_path))
+    assert advises["status"] == "ok"
+    assert advises["result_count"] == 1
+    assert advises["results"][0]["name"] == "placeOrder"
+
+    # The plain caller has no AOP relationships at all in either direction.
+    assert query_graph("advises", plain_caller_qual, repo_root=str(tmp_path))["result_count"] == 0

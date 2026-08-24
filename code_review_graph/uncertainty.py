@@ -74,7 +74,7 @@ _JS_FAMILY = frozenset({"javascript", "typescript", "tsx"})
 # can hide a real answer. ``references_to`` is deliberately excluded: it reads
 # REFERENCES edges, which is exactly where an unresolved handoff does land.
 _CALL_PATTERNS = frozenset({
-    "callers_of", "callees_of", "tests_for", IMPACT_PATTERN,
+    "callers_of", "callees_of", "tests_for", "advises", "advised_by", IMPACT_PATTERN,
 })
 # Patterns answered from IMPORTS_FROM edges.
 _IMPORT_PATTERNS = frozenset({"imports_of", "importers_of", IMPACT_PATTERN})

@@ -46,7 +46,10 @@ Scope (see issue #592 — Option 1, regex-based approximation):
 Reuses the existing ``CALLS`` edge kind rather than introducing a new one,
 so advice→target edges are automatically picked up by ``callers_of``,
 ``callees_of``, and ``get_impact_radius`` without touching their edge-kind
-allowlists.
+allowlists. Two dedicated query patterns, ``advises`` and ``advised_by``,
+filter this same data down to only the ``extra.aop_resolved`` edges — use
+those when the goal is specifically "what AOP relationships exist here"
+rather than every caller/callee regardless of provenance.
 """
 
 from __future__ import annotations
