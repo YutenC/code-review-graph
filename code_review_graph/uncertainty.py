@@ -121,29 +121,18 @@ LANGUAGE_GAPS: tuple[LanguageGap, ...] = (
             "is unresolved, so callers can be missing"
         ),
     ),
-    # Both entries below share (language, patterns), so — per the "first
-    # entry wins" rule documented above — only the AOP note is ever returned
-    # by gap_note() for java call patterns today. It is listed first
-    # deliberately: it is the narrower, currently-verified gap this project
-    # tracks under #592, and is more actionable than the generic reflective-
-    # invocation note. The reflective-invocation entry is kept as accurate,
-    # separately-worded documentation of a distinct blind spot, in case a
-    # future change (e.g. per-pattern gap stacking) makes both reachable.
+    # gap_note() returns only the first match per (language, patterns) (see
+    # its docstring), so a second java/_CALL_PATTERNS entry would never be
+    # reached. The AOP gap narrowed by #592 (within/args/target/this,
+    # cross-aspect refs, compound booleans) and the separate reflective-
+    # invocation gap are folded into one note for that reason.
     LanguageGap(
         languages=frozenset({"java"}),
         patterns=_CALL_PATTERNS,
         note=(
-            "java aop pointcuts using within/args/target/this, cross-aspect "
-            "refs, or compound booleans aren't resolved, so advice can be "
-            "missing (#592)"
-        ),
-    ),
-    LanguageGap(
-        languages=frozenset({"java"}),
-        patterns=_CALL_PATTERNS,
-        note=(
-            "java reflective invocation (Method.invoke) is not statically "
-            "traced, so callers can be missing here"
+            "java aop pointcuts (within/args/target/this, cross-aspect "
+            "refs, compound booleans) and reflective calls are not "
+            "resolved (#592)"
         ),
     ),
     LanguageGap(
