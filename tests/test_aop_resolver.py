@@ -86,6 +86,67 @@ class SomeService {
 }
 """
 
+PACKAGE_WILDCARD_SOURCE = """
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.annotation.Around;
+
+@Aspect
+class LoggingAspect {
+    @Around("execution(* com.foo.service.*.*(..))")
+    Object logAround() { return null; }
+}
+
+class PaymentService {
+    void pay() {}
+}
+
+class UserRepo {
+    void repoMethod() {}
+}
+"""
+
+CLASS_LEVEL_ANNOTATION_SOURCE = """
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.annotation.Before;
+
+@Aspect
+class TxAspect {
+    @Before("@annotation(org.springframework.transaction.annotation.Transactional)")
+    void beforeTx() {}
+}
+
+@Transactional
+class BillingService {
+    void charge() {}
+    void refund() {}
+}
+
+class ReportService {
+    @Transactional
+    void writeReport() {}
+}
+"""
+
+NAMED_COMPOUND_REFERENCE_SOURCE = """
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.annotation.Pointcut;
+import org.aspectj.lang.annotation.Before;
+
+@Aspect
+class BroadAspect {
+    @Pointcut("execution(* *(..)) || execution(* run(..))")
+    void broadPointcut() {}
+
+    @Before("broadPointcut()")
+    void before() {}
+}
+
+class SomeService {
+    void doWork() {}
+    void run() {}
+}
+"""
+
 
 def _build_store(tmp_path: Path, source: str, filename: str = "Aspect.java"):
     path = tmp_path / filename
@@ -173,6 +234,68 @@ def test_compound_boolean_pointcut_is_safely_skipped(tmp_path: Path) -> None:
         assert stats["advice_resolved"] == 0
 
         source_qual = f"{path.as_posix()}::SecurityAspect.checkSecurity"
+        edges = [e for e in store.get_edges_by_source(source_qual) if e.kind == "CALLS"]
+        assert edges == []
+    finally:
+        store.close()
+
+
+def test_package_wildcard_execution_pointcut_resolves_nothing(tmp_path: Path) -> None:
+    """A package-scoped execution() pointcut loses its package portion once
+    reduced (see module docstring / PR #916 review), collapsing to a regex
+    that would otherwise match every class in the codebase. Resolving that
+    to "matches everything" would be worse than resolving to nothing, so the
+    advice must produce zero edges rather than a false CALLS edge into an
+    unrelated class such as UserRepo.
+    """
+    path, store = _build_store(tmp_path, PACKAGE_WILDCARD_SOURCE)
+    try:
+        stats = resolve_aop_advice(store)
+        assert stats["calls_created"] == 0
+        assert stats["advice_resolved"] == 0
+
+        source_qual = f"{path.as_posix()}::LoggingAspect.logAround"
+        edges = [e for e in store.get_edges_by_source(source_qual) if e.kind == "CALLS"]
+        assert edges == []
+    finally:
+        store.close()
+
+
+def test_class_level_annotation_is_not_expanded_to_every_method(tmp_path: Path) -> None:
+    """``@annotation(X)`` must only match methods carrying X directly — a
+    class-level X (e.g. ``@Transactional`` on ``BillingService``) is
+    ``@within()`` semantics, a different designator, and must not be
+    expanded to every method of that class (see module docstring / PR #916
+    review).
+    """
+    path, store = _build_store(tmp_path, CLASS_LEVEL_ANNOTATION_SOURCE)
+    try:
+        stats = resolve_aop_advice(store)
+        assert stats["calls_created"] == 1
+
+        source_qual = f"{path.as_posix()}::TxAspect.beforeTx"
+        edges = [e for e in store.get_edges_by_source(source_qual) if e.kind == "CALLS"]
+        targets = {e.target_qualified for e in edges}
+        assert targets == {f"{path.as_posix()}::ReportService.writeReport"}
+        assert f"{path.as_posix()}::BillingService.charge" not in targets
+        assert f"{path.as_posix()}::BillingService.refund" not in targets
+    finally:
+        store.close()
+
+
+def test_named_reference_to_a_compound_pointcut_is_safely_skipped(tmp_path: Path) -> None:
+    """The compound-operator guard must also apply to the ``@Pointcut`` body
+    a named reference resolves to — a bare reference like
+    ``"broadPointcut()"`` carries no ``&&``/``||`` in its own text even when
+    the pointcut it names does (see module docstring / PR #916 review).
+    """
+    path, store = _build_store(tmp_path, NAMED_COMPOUND_REFERENCE_SOURCE)
+    try:
+        stats = resolve_aop_advice(store)
+        assert stats["calls_created"] == 0
+        assert stats["advice_resolved"] == 0
+
+        source_qual = f"{path.as_posix()}::BroadAspect.before"
         edges = [e for e in store.get_edges_by_source(source_qual) if e.kind == "CALLS"]
         assert edges == []
     finally:
@@ -293,3 +416,16 @@ class TestParseExecutionExpression:
 
     def test_missing_parameter_parens_returns_none(self) -> None:
         assert _parse_execution_expression("execution(* com.foo.Bar.baz)") is None
+
+    def test_package_wildcard_reduces_to_universal_pattern_returns_none(self) -> None:
+        # Dropping the package portion of "com.foo.service.*.*" leaves
+        # "*.*" — indistinguishable from execution(* *(..)), which would
+        # match virtually every method. Must be rejected, not resolved.
+        assert _parse_execution_expression(
+            "execution(* com.foo.service.*.*(..))"
+        ) is None
+
+    def test_bare_method_wildcard_also_returns_none(self) -> None:
+        # A method-name-only "*" pattern (no declaring-type segment) is the
+        # other universal shape — same rejection applies.
+        assert _parse_execution_expression("execution(* *(..))") is None

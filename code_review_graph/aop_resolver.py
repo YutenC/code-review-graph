@@ -21,11 +21,15 @@ Resolution chain:
 Scope (see issue #592 — Option 1, regex-based approximation):
 
 * ``@annotation(some.pkg.Foo)`` pointcuts are matched by simple annotation
-  name (``Foo``) against ``extra["decorators"]`` (methods) and
-  ``extra["spring_annotations"]`` (classes, matching every method in that
-  class). This is exact enough for the common case, but two same-named
+  name (``Foo``) against ``extra["decorators"]`` on the candidate method
+  itself. This is exact enough for the common case, but two same-named
   annotations in different packages are indistinguishable — a known
-  approximation, consistent with the rest of Option 1.
+  approximation, consistent with the rest of Option 1. A *class-level*
+  ``extra["spring_annotations"]`` match (e.g. a class-level
+  ``@Transactional``) is intentionally **not** expanded to every method in
+  that class — that is ``@within()`` semantics, a different pointcut
+  designator, and conflating the two produced widespread false positives
+  on common class-level stereotype annotations (see PR #916 review).
 * ``execution(...)`` pointcuts are converted into a regex applied only to
   the ``ClassName.methodName`` portion of a candidate — the return-type
   pattern, parameter pattern (``(..)``), and any package portion of the
@@ -35,9 +39,19 @@ Scope (see issue #592 — Option 1, regex-based approximation):
   that one file); matching therefore is a strict subset of full AspectJ
   semantics and **can produce both false positives and false negatives**.
   This is deliberate and documented, not an oversight — see issue #592.
-* Pointcut expressions combining multiple sub-expressions with ``&&``,
-  ``||`` (or a bare ``!``) are compound boolean pointcuts and are skipped
-  entirely rather than partially parsed, to avoid emitting a wrong edge.
+  When dropping the package portion reduces the pattern to something that
+  would match virtually every method (e.g. ``com.foo.service.*.*`` losing
+  its package prefix down to a bare ``*.*``), the expression is treated as
+  unresolvable rather than emitting a nearly-unfiltered edge set — see
+  ``_parse_execution_expression``.
+* Pointcut expressions combining multiple sub-expressions with ``&&`` or
+  ``||`` are compound boolean pointcuts and are skipped entirely rather
+  than partially parsed, to avoid emitting a wrong edge. This check also
+  applies to the expression a same-class named ``@Pointcut`` reference
+  resolves to, not just the reference text itself. A bare ``!`` negation
+  is not recognized by either pointcut-kind matcher below, so it is
+  skipped too — just by falling through unparsed rather than via an
+  explicit compound-operator check.
 * ``within(Type+)``, ``args()``/``target()``/``this()``, and named pointcut
   references that cross an ``@Aspect`` class boundary are out of scope for
   this pass (see the narrower AOP ``LanguageGap`` note in
@@ -82,6 +96,13 @@ _ANNOTATION_POINTCUT = re.compile(r"^\s*@annotation\s*\((.+)\)\s*$", re.DOTALL)
 _EXECUTION_POINTCUT = re.compile(r"^\s*execution\s*\((.*)\)\s*$", re.DOTALL)
 
 _DERIVED_FLAG = "aop_resolved"
+
+# What target_pattern reduces to when every segment collapsed to a bare
+# wildcard — i.e. the package portion was the only thing that made the
+# original execution() pattern selective. Resolving these would match
+# nearly every method in the codebase instead of the intended scope, so
+# _parse_execution_expression treats them as unresolvable.
+_UNIVERSAL_REGEXES = frozenset({"^[^.]*$", r"^[^.]*\.[^.]*$"})
 
 
 def _extract_annotation_string_arg(deco_text: str) -> Optional[str]:
@@ -147,7 +168,9 @@ def _parse_execution_expression(expr: str) -> Optional[tuple[str, bool]]:
     method name.  Only the last one or two dot-separated segments of the
     declaring-type+method pattern are used — see module docstring for why
     the package portion is dropped.  Returns ``None`` when the expression
-    cannot be safely reduced (e.g. no parameter-pattern parens found).
+    cannot be safely reduced (e.g. no parameter-pattern parens found), or
+    when discarding the package portion left a pattern that matches
+    virtually every method (see ``_UNIVERSAL_REGEXES`` below).
     """
     m = _EXECUTION_POINTCUT.match(expr)
     if not m:
@@ -175,6 +198,8 @@ def _parse_execution_expression(expr: str) -> Optional[tuple[str, bool]]:
     if not target_pattern:
         return None
     regex_str = "^" + _aspectj_pattern_to_regex(target_pattern) + "$"
+    if regex_str in _UNIVERSAL_REGEXES:
+        return None
     return regex_str, needs_class
 
 
@@ -186,7 +211,11 @@ def _resolve_pointcut_expr(
     Returns the expression to actually parse (``expr`` itself when it is
     already an inline expression), or ``None`` when ``expr`` is a
     cross-aspect reference, an unresolvable reference, or a compound boolean
-    expression — all out of scope for this pass.
+    expression — all out of scope for this pass. The compound check is
+    applied both to ``expr`` and, when ``expr`` is a named reference, to the
+    ``@Pointcut`` body it resolves to — a bare reference like
+    ``"myPointcut()"`` carries no ``&&``/``||`` itself even when the
+    pointcut it names does.
     """
     if any(op in expr for op in _COMPOUND_OPERATORS):
         return None
@@ -194,7 +223,10 @@ def _resolve_pointcut_expr(
     ref = _NAMED_POINTCUT_REF.match(expr)
     if ref:
         name = ref.group(1)
-        return pointcuts.get(name)
+        resolved = pointcuts.get(name)
+        if resolved is None or any(op in resolved for op in _COMPOUND_OPERATORS):
+            return None
+        return resolved
 
     if "." in expr and "(" in expr and not expr.lstrip().startswith(
         ("execution(", "@annotation(", "within(", "args(", "target(", "this("),
@@ -230,7 +262,12 @@ def resolve_aop_advice(store: "GraphStore") -> dict:
         ).fetchall()
     }
     if not java_files:
-        return {"aspects_indexed": 0, "advice_resolved": 0, "calls_created": 0}
+        return {
+            "aspects_indexed": 0,
+            "advice_resolved": 0,
+            "calls_created": 0,
+            "stale_calls_removed": 0,
+        }
 
     # -------------------------------------------------------------------
     # Clear previously derived edges so stale advice→target links from a
@@ -249,25 +286,26 @@ def resolve_aop_advice(store: "GraphStore") -> dict:
     # Index @Aspect classes and every Java method, grouped by (class, file).
     # -------------------------------------------------------------------
     aspect_classes: list[dict] = []
-    all_classes: list[dict] = []
     for row in conn.execute(
         "SELECT name, qualified_name, file_path, extra FROM nodes "
         "WHERE kind = 'Class' AND language = 'java'"
     ).fetchall():
         extra = _load_extra(row["extra"])
-        entry = {
-            "name": row["name"],
-            "qualified_name": row["qualified_name"],
-            "file_path": row["file_path"],
-            "spring_annotations": extra.get("spring_annotations") or [],
-        }
-        all_classes.append(entry)
-        if "Aspect" in entry["spring_annotations"]:
-            aspect_classes.append(entry)
+        if "Aspect" in (extra.get("spring_annotations") or []):
+            aspect_classes.append({
+                "name": row["name"],
+                "qualified_name": row["qualified_name"],
+                "file_path": row["file_path"],
+            })
 
     if not aspect_classes:
         logger.info("AOP resolver: no @Aspect classes found, skipping")
-        return {"aspects_indexed": 0, "advice_resolved": 0, "calls_created": 0}
+        return {
+            "aspects_indexed": 0,
+            "advice_resolved": 0,
+            "calls_created": 0,
+            "stale_calls_removed": len(stale_ids),
+        }
 
     all_methods: list[dict] = []
     methods_by_class_file: dict[tuple[str, str], list[dict]] = {}
@@ -288,14 +326,6 @@ def resolve_aop_advice(store: "GraphStore") -> dict:
         methods_by_class_file.setdefault(
             (row["parent_name"], row["file_path"]), [],
         ).append(entry)
-
-    # Class-level candidates: expand each class's stereotype annotations to
-    # every method it contains, for @annotation-on-class matching.
-    class_methods: dict[str, list[dict]] = {}
-    for cls in all_classes:
-        methods = methods_by_class_file.get((cls["name"], cls["file_path"]), [])
-        for ann in cls["spring_annotations"]:
-            class_methods.setdefault(ann, []).extend(methods)
 
     advice_resolved = 0
     calls_created = 0
@@ -331,17 +361,18 @@ def resolve_aop_advice(store: "GraphStore") -> dict:
                 if not bare_name:
                     continue
                 pointcut_kind = "@annotation"
-                targets = list(class_methods.get(bare_name, []))
-                seen_qn = {t["qualified_name"] for t in targets}
-                for candidate in all_methods:
-                    if candidate["qualified_name"] in seen_qn:
-                        continue
+                # Method-level match only — a class-level stereotype
+                # annotation (e.g. @Transactional) is @within() semantics,
+                # a different pointcut designator, and is not expanded here
+                # (see module docstring).
+                targets = [
+                    candidate
+                    for candidate in all_methods
                     if any(
                         _annotation_head(d) == bare_name
                         for d in candidate["decorators"]
-                    ):
-                        targets.append(candidate)
-                        seen_qn.add(candidate["qualified_name"])
+                    )
+                ]
             else:
                 parsed = _parse_execution_expression(expr)
                 if not parsed:
