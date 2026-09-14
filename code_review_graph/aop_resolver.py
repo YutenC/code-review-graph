@@ -30,20 +30,21 @@ Scope (see issue #592 — Option 1, regex-based approximation):
   that class — that is ``@within()`` semantics, a different pointcut
   designator, and conflating the two produced widespread false positives
   on common class-level stereotype annotations (see PR #916 review).
-* ``execution(...)`` pointcuts are converted into a regex applied only to
-  the ``ClassName.methodName`` portion of a candidate — the return-type
-  pattern, parameter pattern (``(..)``), and any package portion of the
-  declaring-type pattern are all discarded.  The package portion is dropped
-  because parsed nodes are not persisted with a resolved Java package (the
-  ``package`` declaration is only available transiently, during parsing of
-  that one file); matching therefore is a strict subset of full AspectJ
-  semantics and **can produce both false positives and false negatives**.
-  This is deliberate and documented, not an oversight — see issue #592.
-  When dropping the package portion reduces the pattern to something that
-  would match virtually every method (e.g. ``com.foo.service.*.*`` losing
-  its package prefix down to a bare ``*.*``), the expression is treated as
-  unresolvable rather than emitting a nearly-unfiltered edge set — see
-  ``_parse_execution_expression``.
+* ``execution(...)`` pointcuts are converted into a regex applied to the
+  full ``package.ClassName.methodName`` portion of a candidate — the
+  return-type pattern and parameter pattern (``(..)``) are discarded, but
+  the declaring-type pattern (package included) is matched in full against
+  each candidate's resolved Java package (``extra["java_package"]``, set at
+  parse time from the file's ``package`` declaration — see
+  ``_extract_classes`` in ``parser.py``) joined with its class and method
+  name.  A candidate in Java's default (unnamed) package has no
+  ``java_package`` and is matched using the bare ``ClassName.methodName``,
+  so a pointcut that names a package never matches a default-package class.
+  This is still a regex approximation of full AspectJ semantics (no
+  supertype/interface expansion, no ``+`` subtype matching) and can produce
+  false positives/negatives on those axes — see issue #592 — but no longer
+  discards package selectivity: two same-named classes in different
+  packages are no longer conflated (see PR #916 review).
 * Pointcut expressions combining multiple sub-expressions with ``&&`` or
   ``||`` are compound boolean pointcuts and are skipped entirely rather
   than partially parsed, to avoid emitting a wrong edge. This check also
@@ -64,6 +65,19 @@ allowlists. Two dedicated query patterns, ``advises`` and ``advised_by``,
 filter this same data down to only the ``extra.aop_resolved`` edges — use
 those when the goal is specifically "what AOP relationships exist here"
 rather than every caller/callee regardless of provenance.
+
+Edge *direction* for impact analysis is the one place these edges do not
+follow the plain ``CALLS`` policy. ``CALLS`` propagates target→source
+(changing a callee impacts its callers), but an advice does not get called
+by the method it wraps — plain propagation would report "change the
+target, the aspect is impacted" and miss the relationship that actually
+matters: "change the advice (its logic runs around every target), what
+does that impact". ``graph.py``'s impact-radius traversal (both the SQL and
+NetworkX engines) special-cases any edge carrying ``extra.aop_resolved`` to
+always propagate source→target (advice → its targets), overriding
+``IMPACT_EDGE_DIRECTIONS["CALLS"]`` for just these edges — see PR #916
+review. ``callers_of``/``callees_of``/``advises``/``advised_by`` are plain
+graph traversal, not impact analysis, and are unaffected by this override.
 """
 
 from __future__ import annotations
@@ -96,13 +110,6 @@ _ANNOTATION_POINTCUT = re.compile(r"^\s*@annotation\s*\((.+)\)\s*$", re.DOTALL)
 _EXECUTION_POINTCUT = re.compile(r"^\s*execution\s*\((.*)\)\s*$", re.DOTALL)
 
 _DERIVED_FLAG = "aop_resolved"
-
-# What target_pattern reduces to when every segment collapsed to a bare
-# wildcard — i.e. the package portion was the only thing that made the
-# original execution() pattern selective. Resolving these would match
-# nearly every method in the codebase instead of the intended scope, so
-# _parse_execution_expression treats them as unresolvable.
-_UNIVERSAL_REGEXES = frozenset({"^[^.]*$", r"^[^.]*\.[^.]*$"})
 
 
 def _extract_annotation_string_arg(deco_text: str) -> Optional[str]:
@@ -163,14 +170,13 @@ def _parse_execution_expression(expr: str) -> Optional[tuple[str, bool]]:
 
     ``needs_class`` is True when the expression's method-pattern token
     included a declaring-type segment (e.g. ``com.foo.*.*``), so the regex
-    must be matched against ``ClassName.methodName``; it is False for a
-    method-name-only pattern (e.g. ``*get*Index``), matched against the bare
-    method name.  Only the last one or two dot-separated segments of the
-    declaring-type+method pattern are used — see module docstring for why
-    the package portion is dropped.  Returns ``None`` when the expression
-    cannot be safely reduced (e.g. no parameter-pattern parens found), or
-    when discarding the package portion left a pattern that matches
-    virtually every method (see ``_UNIVERSAL_REGEXES`` below).
+    must be matched against the candidate's full ``package.ClassName.methodName``
+    (see ``resolve_aop_advice``); it is False for a method-name-only pattern
+    (e.g. ``*get*Index``), matched against the bare method name.  The full
+    declaring-type+method pattern is kept, package included — no segments are
+    dropped, so an explicit package qualifier in the pointcut stays selective
+    (see module docstring).  Returns ``None`` when the expression cannot be
+    safely reduced (e.g. no parameter-pattern parens found).
     """
     m = _EXECUTION_POINTCUT.match(expr)
     if not m:
@@ -186,20 +192,11 @@ def _parse_execution_expression(expr: str) -> Optional[tuple[str, bool]]:
     if not tokens:
         return None
     method_class_pattern = tokens[-1]
-
-    segments = method_class_pattern.split(".")
-    if len(segments) == 1:
-        target_pattern = segments[0]
-        needs_class = False
-    else:
-        target_pattern = f"{segments[-2]}.{segments[-1]}"
-        needs_class = True
-
-    if not target_pattern:
+    if not method_class_pattern:
         return None
-    regex_str = "^" + _aspectj_pattern_to_regex(target_pattern) + "$"
-    if regex_str in _UNIVERSAL_REGEXES:
-        return None
+
+    needs_class = "." in method_class_pattern
+    regex_str = "^" + _aspectj_pattern_to_regex(method_class_pattern) + "$"
     return regex_str, needs_class
 
 
@@ -286,11 +283,15 @@ def resolve_aop_advice(store: "GraphStore") -> dict:
     # Index @Aspect classes and every Java method, grouped by (class, file).
     # -------------------------------------------------------------------
     aspect_classes: list[dict] = []
+    class_package_by_name_file: dict[tuple[str, str], str] = {}
     for row in conn.execute(
         "SELECT name, qualified_name, file_path, extra FROM nodes "
         "WHERE kind = 'Class' AND language = 'java'"
     ).fetchall():
         extra = _load_extra(row["extra"])
+        class_package_by_name_file[(row["name"], row["file_path"])] = (
+            extra.get("java_package") or ""
+        )
         if "Aspect" in (extra.get("spring_annotations") or []):
             aspect_classes.append({
                 "name": row["name"],
@@ -321,6 +322,9 @@ def resolve_aop_advice(store: "GraphStore") -> dict:
             "parent_name": row["parent_name"],
             "file_path": row["file_path"],
             "decorators": extra.get("decorators") or [],
+            "java_package": class_package_by_name_file.get(
+                (row["parent_name"], row["file_path"]), "",
+            ),
         }
         all_methods.append(entry)
         methods_by_class_file.setdefault(
@@ -388,7 +392,12 @@ def resolve_aop_advice(store: "GraphStore") -> dict:
                     if needs_class:
                         if not candidate["parent_name"]:
                             continue
-                        subject = f"{candidate['parent_name']}.{candidate['name']}"
+                        class_part = (
+                            f"{candidate['java_package']}.{candidate['parent_name']}"
+                            if candidate["java_package"]
+                            else candidate["parent_name"]
+                        )
+                        subject = f"{class_part}.{candidate['name']}"
                     else:
                         subject = candidate["name"]
                     if pattern.match(subject):
