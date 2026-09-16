@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 
@@ -7,6 +8,7 @@ from code_review_graph.aop_resolver import (
     resolve_aop_advice,
 )
 from code_review_graph.graph import GraphStore
+from code_review_graph.incremental import full_build, incremental_update
 from code_review_graph.parser import CodeParser, EdgeInfo
 from code_review_graph.tools.query import query_graph
 
@@ -205,6 +207,83 @@ class SomeService {
 }
 """
 
+VALUE_NAMED_ARG_SOURCE = """
+package com.foo.service;
+
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.annotation.Around;
+
+@Aspect
+class LoggingAspect {
+    @Around(value = "execution(* com.foo.service.PaymentService.*(..))")
+    Object logAround() { return null; }
+}
+
+class PaymentService {
+    void pay() {}
+}
+"""
+
+CROSS_ASPECT_REFERENCE_SOURCE = """
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.annotation.Before;
+
+@Aspect
+class ConsumerAspect {
+    @Before("OtherAspect.sharedPointcut()")
+    void beforeShared() {}
+}
+
+class SomeService {
+    void doWork() {}
+}
+"""
+
+UNRESOLVABLE_NAMED_REFERENCE_SOURCE = """
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.annotation.Before;
+
+@Aspect
+class DanglingAspect {
+    @Before("missingPointcut()")
+    void beforeMissing() {}
+}
+
+class SomeService {
+    void doWork() {}
+}
+"""
+
+NO_STRING_ARGUMENT_SOURCE = """
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.annotation.Before;
+
+@Aspect
+class NoArgAspect {
+    @Before(AccessCheck.class)
+    void beforeCheck() {}
+}
+
+class SomeService {
+    void doWork() {}
+}
+"""
+
+UNIVERSAL_POINTCUT_SOURCE = """
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.annotation.Before;
+
+@Aspect
+class UniversalAspect {
+    @Before("execution(* *(..))")
+    void logAll() {}
+}
+
+class SomeService {
+    void doWork() {}
+}
+"""
+
 
 def _build_store(tmp_path: Path, source: str, filename: str = "Aspect.java"):
     path = tmp_path / filename
@@ -277,6 +356,60 @@ def test_execution_pointcut_around_advice_creates_calls_edge(tmp_path: Path) -> 
         store.close()
 
 
+def test_value_named_argument_form_is_extracted(tmp_path: Path) -> None:
+    """``_extract_annotation_string_arg`` must also recognize the
+    ``value = "..."`` named-argument form, not just the positional form
+    (covered above) and the ``pointcut = "..."`` form (covered by
+    test_named_pointcut_reference_resolves_both_advices).
+    """
+    path, store = _build_store(tmp_path, VALUE_NAMED_ARG_SOURCE)
+    try:
+        stats = resolve_aop_advice(store)
+        assert stats["calls_created"] == 1
+
+        source_qual = f"{path.as_posix()}::LoggingAspect.logAround"
+        edges = [e for e in store.get_edges_by_source(source_qual) if e.kind == "CALLS"]
+        assert len(edges) == 1
+        assert edges[0].target_qualified == f"{path.as_posix()}::PaymentService.pay"
+        assert edges[0].extra["pointcut_expr"] == (
+            "execution(* com.foo.service.PaymentService.*(..))"
+        )
+    finally:
+        store.close()
+
+
+def test_resolve_aop_advice_is_idempotent(tmp_path: Path) -> None:
+    """Running the resolver twice with no source changes must not duplicate
+    or drift edges: the second run's ``stale_calls_removed`` must equal the
+    first run's ``calls_created``, and the resulting edge set must be
+    unchanged (see module docstring: "Safe to call multiple times").
+    """
+    path, store = _build_store(tmp_path, EXECUTION_SOURCE)
+    try:
+        first = resolve_aop_advice(store)
+        assert first["calls_created"] == 1
+
+        source_qual = f"{path.as_posix()}::LoggingAspect.logAround"
+        first_edges = {
+            e.target_qualified
+            for e in store.get_edges_by_source(source_qual)
+            if e.kind == "CALLS"
+        }
+
+        second = resolve_aop_advice(store)
+        assert second["stale_calls_removed"] == first["calls_created"]
+        assert second["calls_created"] == first["calls_created"]
+
+        second_edges = {
+            e.target_qualified
+            for e in store.get_edges_by_source(source_qual)
+            if e.kind == "CALLS"
+        }
+        assert second_edges == first_edges
+    finally:
+        store.close()
+
+
 def test_named_pointcut_reference_resolves_both_advices(tmp_path: Path) -> None:
     path, store = _build_store(tmp_path, NAMED_POINTCUT_SOURCE)
     try:
@@ -313,6 +446,59 @@ def test_compound_boolean_pointcut_is_safely_skipped(tmp_path: Path) -> None:
         assert stats["advice_resolved"] == 0
 
         source_qual = f"{path.as_posix()}::SecurityAspect.checkSecurity"
+        edges = [e for e in store.get_edges_by_source(source_qual) if e.kind == "CALLS"]
+        assert edges == []
+    finally:
+        store.close()
+
+
+def test_cross_aspect_dotted_reference_is_safely_skipped(tmp_path: Path) -> None:
+    """A dotted ``Other.pointcut()`` reference crosses an ``@Aspect`` class
+    boundary, which is out of scope for this pass (see module docstring) —
+    it must be skipped rather than misparsed as an inline expression.
+    """
+    path, store = _build_store(tmp_path, CROSS_ASPECT_REFERENCE_SOURCE)
+    try:
+        stats = resolve_aop_advice(store)
+        assert stats["calls_created"] == 0
+        assert stats["advice_resolved"] == 0
+
+        source_qual = f"{path.as_posix()}::ConsumerAspect.beforeShared"
+        edges = [e for e in store.get_edges_by_source(source_qual) if e.kind == "CALLS"]
+        assert edges == []
+    finally:
+        store.close()
+
+
+def test_unresolvable_named_reference_is_safely_skipped(tmp_path: Path) -> None:
+    """A same-class named reference to a ``@Pointcut`` that does not exist
+    must be skipped rather than raising or matching everything.
+    """
+    path, store = _build_store(tmp_path, UNRESOLVABLE_NAMED_REFERENCE_SOURCE)
+    try:
+        stats = resolve_aop_advice(store)
+        assert stats["calls_created"] == 0
+        assert stats["advice_resolved"] == 0
+
+        source_qual = f"{path.as_posix()}::DanglingAspect.beforeMissing"
+        edges = [e for e in store.get_edges_by_source(source_qual) if e.kind == "CALLS"]
+        assert edges == []
+    finally:
+        store.close()
+
+
+def test_advice_with_no_string_argument_is_safely_skipped(tmp_path: Path) -> None:
+    """An advice annotation with no string-literal argument (e.g.
+    ``@Before(AccessCheck.class)``) has no pointcut expression to extract —
+    it must be dropped before the advice list, not crash the resolver.
+    """
+    path, store = _build_store(tmp_path, NO_STRING_ARGUMENT_SOURCE)
+    try:
+        stats = resolve_aop_advice(store)
+        assert stats["calls_created"] == 0
+        assert stats["advice_resolved"] == 0
+
+        source_qual = f"{path.as_posix()}::NoArgAspect.beforeCheck"
         edges = [e for e in store.get_edges_by_source(source_qual) if e.kind == "CALLS"]
         assert edges == []
     finally:
@@ -421,6 +607,26 @@ def test_named_reference_to_a_compound_pointcut_is_safely_skipped(tmp_path: Path
         store.close()
 
 
+def test_self_edge_guard_skips_advice_matching_itself(tmp_path: Path) -> None:
+    """A pointcut broad enough to match the advice method's own signature
+    (``execution(* *(..))``) must not create a self-referencing CALLS edge,
+    while still resolving to genuine other targets in the same build.
+    """
+    path, store = _build_store(tmp_path, UNIVERSAL_POINTCUT_SOURCE)
+    try:
+        stats = resolve_aop_advice(store)
+
+        source_qual = f"{path.as_posix()}::UniversalAspect.logAll"
+        edges = [e for e in store.get_edges_by_source(source_qual) if e.kind == "CALLS"]
+        targets = {e.target_qualified for e in edges}
+
+        assert source_qual not in targets
+        assert f"{path.as_posix()}::SomeService.doWork" in targets
+        assert stats["calls_created"] == len(targets)
+    finally:
+        store.close()
+
+
 def test_callers_of_query_finds_advice_method(tmp_path: Path) -> None:
     path, store = _build_store(tmp_path, ANNOTATION_SOURCE)
     try:
@@ -512,6 +718,82 @@ def test_impact_radius_propagates_from_advice_to_target_not_the_reverse(
         assert advice_qual not in impacted_from_target
     finally:
         store.close()
+
+
+def test_networkx_impact_radius_propagates_from_advice_to_target_not_the_reverse(
+    tmp_path: Path,
+) -> None:
+    """Same direction guarantee as
+    test_impact_radius_propagates_from_advice_to_target_not_the_reverse,
+    verified directly against the NetworkX engine (``CRG_BFS_ENGINE=networkx``
+    routes through this method) rather than the default SQL engine — both
+    engines special-case ``extra.aop_resolved`` edges the same way (see
+    module docstring).
+    """
+    paths, store = _build_store_multi(tmp_path, {
+        "AccessLimitAspect.java": ANNOTATION_ASPECT_ONLY_SOURCE,
+        "OrderController.java": ANNOTATION_TARGET_ONLY_SOURCE,
+    })
+    try:
+        resolve_aop_advice(store)
+
+        aspect_path = paths["AccessLimitAspect.java"].as_posix()
+        target_path = paths["OrderController.java"].as_posix()
+        advice_qual = f"{aspect_path}::AccessLimitAspect.beforeLimit"
+        target_qual = f"{target_path}::OrderController.placeOrder"
+
+        advice_impact = store._get_impact_radius_networkx([aspect_path])
+        impacted_from_advice = {n.qualified_name for n in advice_impact["impacted_nodes"]}
+        assert target_qual in impacted_from_advice
+
+        target_impact = store._get_impact_radius_networkx([target_path])
+        impacted_from_target = {n.qualified_name for n in target_impact["impacted_nodes"]}
+        assert advice_qual not in impacted_from_target
+    finally:
+        store.close()
+
+
+def _aop_edges(store: GraphStore) -> list:
+    rows = store._conn.execute(
+        "SELECT source_qualified, target_qualified, extra FROM edges WHERE kind = 'CALLS'"
+    ).fetchall()
+    return [row for row in rows if json.loads(row["extra"] or "{}").get("aop_resolved")]
+
+
+def test_incremental_annotation_removal_removes_stale_aop_call(tmp_path: Path) -> None:
+    """Mirrors
+    test_spring_events.py::test_incremental_listener_change_removes_stale_event_call:
+    a full_build resolves the advice->target edge, then removing the
+    target's annotation and running incremental_update on just that file
+    must clear the now-stale ``aop_resolved`` edge (see module docstring:
+    "previously derived edges ... are cleared and rebuilt on every call").
+    """
+    aspect_path = tmp_path / "AccessLimitAspect.java"
+    controller_path = tmp_path / "OrderController.java"
+    aspect_path.write_text(ANNOTATION_ASPECT_ONLY_SOURCE, encoding="utf-8")
+    controller_path.write_text(ANNOTATION_TARGET_ONLY_SOURCE, encoding="utf-8")
+
+    graph_dir = tmp_path / ".code-review-graph"
+    graph_dir.mkdir()
+
+    with GraphStore(graph_dir / "graph.db") as store:
+        first = full_build(tmp_path, store)
+        assert first["aop_resolution"]["calls_created"] == 1
+        assert len(_aop_edges(store)) == 1
+
+        controller_path.write_text(
+            "class OrderController {\n    void placeOrder() {}\n}\n",
+            encoding="utf-8",
+        )
+        updated = incremental_update(
+            tmp_path,
+            store,
+            changed_files=["OrderController.java"],
+        )
+
+        assert updated["aop_resolution"] is not None
+        assert updated["aop_resolution"]["calls_created"] == 0
+        assert _aop_edges(store) == []
 
 
 class TestAspectjPatternToRegex:
