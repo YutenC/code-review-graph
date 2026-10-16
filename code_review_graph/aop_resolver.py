@@ -140,7 +140,10 @@ def _aspectj_pattern_to_regex(pattern: str) -> str:
     Rules (approximate — see module docstring for the scope this is applied
     within):
 
-    * ``..`` means "any number of intervening path segments" → ``.*``
+    * ``..`` means "any number of intervening path segments" →
+      ``\\.(?:[^.]+\\.)*`` — whole dot-delimited segments only, never a bare
+      ``.*``: repeated ``.*`` fragments backtrack catastrophically, and the
+      pointcut text comes from the repository being indexed
     * a lone ``.`` is a literal separator → escaped ``\\.``
     * ``*`` within a segment means "anything but a dot" → ``[^.]*``
     * every other character is matched literally
@@ -151,7 +154,7 @@ def _aspectj_pattern_to_regex(pattern: str) -> str:
     while i < n:
         ch = pattern[i]
         if ch == "." and i + 1 < n and pattern[i + 1] == ".":
-            out.append(".*")
+            out.append(r"\.(?:[^.]+\.)*")
             i += 2
         elif ch == ".":
             out.append(r"\.")

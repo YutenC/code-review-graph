@@ -811,15 +811,18 @@ class TestAspectjPatternToRegex:
         assert pattern.match("Service")
         assert not pattern.match("internal.Service")
 
-    def test_double_dot_becomes_a_permissive_any_match(self) -> None:
-        # ".." is documented as "any number of intervening path segments", but
-        # it compiles to a bare ".*" — it matches any characters at all, not
-        # only well-formed dot-separated segments. This test pins the actual
-        # (looser) behavior so a future change to the translation is a
-        # deliberate, visible diff rather than a silent regression either way.
+    def test_double_dot_matches_whole_segments_only(self) -> None:
+        # ".." means "any number of intervening path segments": zero or more
+        # whole dot-delimited segments, never arbitrary characters. A bare
+        # ".*" would also match "comXService" and backtracks catastrophically
+        # when repeated (see test_aop_resolution_edge_cases.py).
         pattern = re.compile("^" + _aspectj_pattern_to_regex("com..Service") + "$")
+        assert pattern.match("com.Service")
+        assert pattern.match("com.foo.Service")
         assert pattern.match("com.foo.bar.Service")
-        assert pattern.match("comXService")  # crosses non-dot characters too
+        assert not pattern.match("comXService")
+        assert not pattern.match("com.foo.barService")
+        assert not pattern.match("com..Service")
 
     def test_special_regex_characters_are_escaped(self) -> None:
         pattern = re.compile("^" + _aspectj_pattern_to_regex("Foo$Bar") + "$")
